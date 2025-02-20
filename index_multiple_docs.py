@@ -1,125 +1,133 @@
 import os
 import json
-import argparse
 import faiss
+import time
+import random
 import numpy as np
 import openai
 from dotenv import load_dotenv
 
-from data_ingestion.parse_documents import parse_pdf, clean_text, chunk_text
-from semantic_search.semantic_search import load_faiss_index, load_metadata
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY", "")
 
-load_dotenv()  # Ensure .env is loaded
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-def get_embeddings(chunks, model="text-embedding-3-small", batch_size=50):
+def get_embeddings_in_batches(texts, batch_size=20, model="text-embedding-ada-002"):
     """
-    Call OpenAI API to get embedding vectors for text chunks in batches.
+    Embed a list of texts in batches. Retries on failure with exponential backoff.
     Returns a list of embedding vectors.
     """
-    embeddings = []
-    n_batches = (len(chunks) + batch_size - 1) // batch_size
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i:i + batch_size]
-        response = openai.Embedding.create(input=batch, model=model)
-        batch_embeddings = [data["embedding"] for data in response["data"]]
-        embeddings.extend(batch_embeddings)
-        print(f"Processed batch {(i // batch_size) + 1} of {n_batches}")
-    return embeddings
+    all_embeddings = []
+    total = len(texts)
+    i = 0
+    while i < total:
+        batch = texts[i : i + batch_size]
+        for _retry in range(5):  # up to 5 retries
+            try:
+                response = openai.Embedding.create(
+                    input=batch,
+                    model=model
+                )
+                embeddings = [item["embedding"] for item in response["data"]]
+                all_embeddings.extend(embeddings)
+                break
+            except Exception as e:
+                print(f"Embedding error on batch {i}-{i+batch_size}: {e}")
+                backoff = 2 ** _retry + random.random()
+                time.sleep(backoff)
+        else:
+            # If we exhausted all retries, skip these items or handle differently
+            print(f"Skipping batch {i}-{i+batch_size} after 5 retries.")
+        i += batch_size
+        processed = min(i, total)
+        print(f"Progress: Processed {processed}/{total} chunks.")
+    return all_embeddings
 
-def index_multiple_docs(pdf_directory="data/pdfs", index_path="faiss_index.index", metadata_path="chunk_metadata.json"):
+def create_or_load_faiss_index(dim, index_path="faiss_index.index"):
     """
-    Ingest and index multiple PDF files from a directory.
-    If an existing FAISS index is found, new embeddings are appended.
+    If an index file exists, load it; otherwise, create a new IndexFlatL2.
     """
-    # 1. Gather all PDF files.
-    pdf_files = [
-        f for f in os.listdir(pdf_directory)
-        if f.lower().endswith(".pdf")
-    ]
-    if not pdf_files:
-        print(f"No PDF files found in {pdf_directory}. Exiting.")
-        return
-
-    # 2. Load existing index & metadata if available.
-    index = None
-    existing_metadata = {}
-    if os.path.exists(index_path) and os.path.exists(metadata_path):
-        index = load_faiss_index(index_path)
-        existing_metadata = load_metadata(metadata_path)
-        print(f"Loaded existing FAISS index with {index.ntotal} vectors.")
+    if os.path.exists(index_path):
+        index = faiss.read_index(index_path)
+        print(f"Loaded existing index with {index.ntotal} vectors.")
+        return index
     else:
-        print("No existing index found. A new one will be created.")
+        index = faiss.IndexFlatL2(dim)
+        print("Created a new FAISS IndexFlatL2.")
+        return index
 
-    # 3. Collect all new chunks and metadata.
-    all_new_chunks = []
-    new_metadata_dict = {}
-    offset = 0
-    if existing_metadata:
-        existing_ids = list(map(int, existing_metadata.keys()))
-        offset = max(existing_ids) + 1
-
-    for pdf_file in pdf_files:
-        pdf_path = os.path.join(pdf_directory, pdf_file)
-        print(f"Processing: {pdf_path}")
-        raw_text = parse_pdf(pdf_path)
-        if not raw_text:
-            print(f"No text extracted from {pdf_file}.")
-            continue
-        cleaned_text = clean_text(raw_text)
-        chunks = chunk_text(cleaned_text, max_chunk_size=4000)
-
-        # Use the filename as a document id
-        doc_id = pdf_file
-
-        for chunk in chunks:
-            all_new_chunks.append(chunk)
-            new_metadata_dict[str(offset)] = {
-                "doc_id": doc_id,
-                "text": chunk
-            }
-            offset += 1
-
-    if not all_new_chunks:
-        print("No new text chunks found. Exiting.")
+def index_multiple_docs(parsed_json="all_chunks.json", index_path="faiss_index.index", metadata_path="chunk_metadata.json"):
+    """
+    Reads parsed text chunks from a JSON file, embeds them in batches,
+    and adds them to a FAISS index with incremental metadata.
+    """
+    if not os.path.exists(parsed_json):
+        print(f"No parsed data file found at {parsed_json}. Exiting.")
         return
 
-    # 4. Batch generate embeddings for all collected chunks.
-    embeddings = get_embeddings(all_new_chunks, batch_size=50)
-    embedding_matrix = np.array(embeddings).astype("float32")
+    # Load existing metadata or create new
+    if os.path.exists(metadata_path):
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+        offset = max(map(int, metadata.keys())) + 1 if metadata else 0
+    else:
+        metadata = {}
+        offset = 0
 
-    # 5. Create new index if one doesn't exist, otherwise update.
-    if index is None:
-        dim = embedding_matrix.shape[1]
-        index = faiss.IndexFlatL2(dim)
-        print("Created a new FAISS index.")
+    with open(parsed_json, "r") as f:
+        parsed_data = json.load(f)
+
+    all_texts = []
+    all_ids = []
+    if isinstance(parsed_data, dict):
+        for pdf_file, chunks in parsed_data.items():
+            print(f"Starting indexing document: {pdf_file} with {len(chunks)} chunks.")
+            for chunk in chunks:
+                all_texts.append((pdf_file, chunk))
+                all_ids.append(str(offset))
+                offset += 1
+            print(f"Finished indexing document: {pdf_file}")
+    elif isinstance(parsed_data, list):
+        print(f"Starting indexing of {len(parsed_data)} chunks from unknown document.")
+        for chunk in parsed_data:
+            all_texts.append(("unknown", chunk))
+            all_ids.append(str(offset))
+            offset += 1
+        print("Finished indexing unknown document.")
+    else:
+        print("Unexpected format in parsed JSON. Exiting.")
+        return
+
+    # Convert texts to a list of just the chunk text
+    chunk_texts = [t[1] for t in all_texts]
+
+    # 1. Get embeddings in batches
+    embeddings = get_embeddings_in_batches(chunk_texts, batch_size=20, model="text-embedding-ada-002")
+    if not embeddings:
+        print("No embeddings generated. Exiting.")
+        return
+
+    # 2. Build or load FAISS index
+    dim = len(embeddings[0])  # dimension from the first embedding
+    index = create_or_load_faiss_index(dim, index_path=index_path)
+
+    # 3. Add embeddings to FAISS
+    embedding_matrix = np.array(embeddings).astype('float32')
     index.add(embedding_matrix)
-    print(f"Added {len(embeddings)} new vectors to the index.")
-
-    # 6. Save the FAISS index.
     faiss.write_index(index, index_path)
-    print(f"FAISS index saved to {index_path}.")
+    print(f"FAISS index now has {index.ntotal} vectors.")
 
-    # 7. Update and save metadata.
-    existing_metadata.update(new_metadata_dict)
+    # 4. Update metadata
+    for idx, (pdf_file, chunk) in zip(all_ids, all_texts):
+        metadata[idx] = {
+            "doc_id": pdf_file,
+            "text": chunk
+        }
     with open(metadata_path, "w") as f:
-        json.dump(existing_metadata, f, indent=2)
-    print(f"Metadata saved to {metadata_path}.")
-
-def main():
-    parser = argparse.ArgumentParser(description="Index multiple PDF files.")
-    parser.add_argument("--pdf_directory", type=str, default="data/pdfs", help="Path to folder with PDFs.")
-    parser.add_argument("--index_path", type=str, default="faiss_index.index", help="Path to FAISS index.")
-    parser.add_argument("--metadata_path", type=str, default="chunk_metadata.json", help="Path to metadata JSON.")
-    args = parser.parse_args()
-
-    index_multiple_docs(
-        pdf_directory=args.pdf_directory,
-        index_path=args.index_path,
-        metadata_path=args.metadata_path
-    )
+        json.dump(metadata, f, indent=2)
+    print(f"Metadata updated with {len(all_texts)} new entries.")
 
 if __name__ == "__main__":
-    main()
+    index_multiple_docs()
+
+
 
 
