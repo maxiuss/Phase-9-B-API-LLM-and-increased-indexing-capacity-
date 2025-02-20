@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY", "")
 
-def get_embeddings_in_batches(texts, batch_size=20, model="text-embedding-ada-002"):
+def get_embeddings_in_batches(texts, batch_size=20, model="Text-embedding-3-small"):
     """
     Embed a list of texts in batches. Retries on failure with exponential backoff.
     Returns a list of embedding vectors.
@@ -20,7 +20,7 @@ def get_embeddings_in_batches(texts, batch_size=20, model="text-embedding-ada-00
     i = 0
     while i < total:
         batch = texts[i : i + batch_size]
-        for _retry in range(5):  # up to 5 retries
+        for _retry in range(5):  # up to 5 retries/py
             try:
                 response = openai.Embedding.create(
                     input=batch,
@@ -100,7 +100,7 @@ def index_multiple_docs(parsed_json="all_chunks.json", index_path="faiss_index.i
     chunk_texts = [t[1] for t in all_texts]
 
     # 1. Get embeddings in batches
-    embeddings = get_embeddings_in_batches(chunk_texts, batch_size=20, model="text-embedding-ada-002")
+    embeddings = get_embeddings_in_batches(chunk_texts, batch_size=20, model="text-embedding-3-small")
     if not embeddings:
         print("No embeddings generated. Exiting.")
         return
